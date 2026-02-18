@@ -18,6 +18,8 @@ from src.utils.excel import save_portfolio_table
 def main() -> None:
     df = pd.read_csv(REPO_ROOT / "data/base_vendas_historica.csv", parse_dates=["data"])
     assert df["cliente_id"].notna().all() and df["receita"].gt(0).all(), "Sanity check falhou para safra."
+    expected_cols = {"cliente_id", "data", "receita"}
+    assert expected_cols.issubset(df.columns), f"Schema inválido. Colunas ausentes: {expected_cols - set(df.columns)}"
 
     first_purchase = df.groupby("cliente_id")["data"].min().dt.to_period("M").astype(str).rename("coorte")
     df = df.join(first_purchase, on="cliente_id")
@@ -29,17 +31,21 @@ def main() -> None:
         df.groupby(["coorte", "periodo_idx"])["cliente_id"].nunique().reset_index(name="clientes_ativos")
     )
     base_size = cohort_counts[cohort_counts["periodo_idx"] == 0][["coorte", "clientes_ativos"]].rename(columns={"clientes_ativos": "clientes_base"})
+    assert base_size["coorte"].is_unique, "Duplicidade de coorte na base de referência."
     cohort_counts = cohort_counts.merge(base_size, on="coorte", how="left")
     cohort_counts["retencao"] = (cohort_counts["clientes_ativos"] / cohort_counts["clientes_base"]).round(4)
+    assert cohort_counts["retencao"].between(0, 1).all(), "Retenção fora do range esperado [0, 1]."
 
-    retention_matrix = cohort_counts.pivot(index="coorte", columns="periodo_idx", values="retencao").fillna(0).sort_index()
+    # Mantém períodos não observados como NaN para não interpretar maturação ausente como churn.
+    retention_matrix = cohort_counts.pivot(index="coorte", columns="periodo_idx", values="retencao").sort_index()
 
     revenue_by_cohort = df.groupby("coorte", as_index=False)["receita"].sum()
     resumo = base_size.merge(revenue_by_cohort, on="coorte", how="left")
     for m in [1, 2, 3]:
         col = cohort_counts[cohort_counts["periodo_idx"] == m][["coorte", "retencao"]].rename(columns={"retencao": f"retencao_m{m}"})
         resumo = resumo.merge(col, on="coorte", how="left")
-    resumo = resumo.fillna(0).sort_values("coorte")
+    resumo["receita"] = resumo["receita"].fillna(0)
+    resumo = resumo.sort_values("coorte")
 
     detalhe = retention_matrix.reset_index()
     parametros = pd.DataFrame(
@@ -68,8 +74,9 @@ def main() -> None:
     fig.savefig(out_dir / "03_grafico_principal.png", dpi=180)
     plt.close(fig)
 
-    top = resumo.sort_values("retencao_m1", ascending=False).head(3)["coorte"].tolist()
-    low = resumo.sort_values("retencao_m1", ascending=True).head(3)["coorte"].tolist()
+    maturadas_m1 = resumo[resumo["retencao_m1"].notna()]
+    top = maturadas_m1.sort_values("retencao_m1", ascending=False).head(3)["coorte"].tolist()
+    low = maturadas_m1.sort_values("retencao_m1", ascending=True).head(3)["coorte"].tolist()
     texto = [
         "- Coortes mais fortes em M1: " + ", ".join(top),
         "- Coortes mais fracas em M1: " + ", ".join(low),
